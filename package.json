@@ -6,7 +6,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/server-github": "^0.6.2",
     "cors": "^2.8.5",
     "express": "^4.21.1"
   },
@@ -14,4 +13,3 @@
     "node": ">=18.0.0"
   }
 }
-
