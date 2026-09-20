@@ -6,48 +6,58 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-let mcpProcess = null;
+// Health check routes
+app.get('/', (req, res) => res.json({ status: "active", protocol: "mcp" }));
+app.get('/mcp', (req, res) => res.json({ status: "active", protocol: "mcp" }));
 
-// 1. Instant Health Checks so Gemini doesn't time out
-app.get('/', (req, res) => res.json({ status: "active" }));
-app.get('/mcp', (req, res) => res.json({ status: "active" }));
-
-// 2. The main SSE Stream
-app.get('/sse', (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
-    const proto = req.headers['x-forwarded-proto'] || req.protocol;
-    const host = req.headers.host;
-    res.write(`event: endpoint\ndata: ${proto}://${host}/message\n\n`);
-
-    if (mcpProcess) mcpProcess.kill();
-
-    // The Fix: '--no-install' forces it to instantly use the downloaded package
-    mcpProcess = spawn('npx', ['--no-install', '@modelcontextprotocol/server-github'], {
+// Handle synchronous JSON-RPC calls from Gemini Spark
+app.post('/mcp', (req, res) => {
+    const mcpProcess = spawn('npx', ['--no-install', '@modelcontextprotocol/server-github'], {
         env: { ...process.env, GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_PAT }
     });
 
+    let outputData = '';
+    let errorData = '';
+
     mcpProcess.stdout.on('data', (data) => {
-        const lines = data.toString().split('\n');
-        for (const line of lines) {
-            if (line.trim().startsWith('{')) {
-                res.write(`event: message\ndata: ${line}\n\n`);
-            }
-        }
+        outputData += data.toString();
     });
 
-    mcpProcess.stderr.on('data', (data) => console.error(data.toString()));
-    req.on('close', () => { if (mcpProcess) mcpProcess.kill(); });
-});
+    mcpProcess.stderr.on('data', (data) => {
+        errorData += data.toString();
+    });
 
-// 3. Receive Messages from Gemini
-app.post('/message', (req, res) => {
-    if (!mcpProcess) return res.status(400).send('No connection');
+    mcpProcess.on('close', (code) => {
+        if (code !== 0 && !outputData) {
+            return res.status(500).json({
+                jsonrpc: "2.0",
+                error: { code: -32000, message: errorData || "MCP server failed" }
+            });
+        }
+
+        // Parse lines from output and find the valid JSON-RPC response
+        const lines = outputData.split('\n');
+        for (const line of lines) {
+            if (line.trim().startsWith('{')) {
+                try {
+                    const jsonRes = JSON.parse(line.trim());
+                    return res.json(jsonRes);
+                } catch (e) {
+                    // Continue scanning lines if not valid JSON yet
+                }
+            }
+        }
+
+        res.status(500).json({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "No valid JSON-RPC response generated", details: outputData }
+        });
+    });
+
+    // Send Gemini's payload directly into the official server's standard input
     mcpProcess.stdin.write(JSON.stringify(req.body) + '\n');
-    res.send('ok');
+    mcpProcess.stdin.end();
 });
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Sync MCP Bridge running on port ${PORT}`));
