@@ -60,21 +60,23 @@ async function ghJson(url, options = {}) {
 const TOOLS = [
     {
         name: 'get_file_contents',
-        description: 'Reads a file (or lists a directory) in a GitHub repository.',
+        description: 'Reads a file (or lists a directory) in a GitHub repository. Large files are returned in chunks of about 28000 characters: use start_line and end_line to read further.',
         inputSchema: {
             type: 'object',
             properties: {
                 owner: { type: 'string' },
                 repo: { type: 'string' },
                 path: { type: 'string' },
-                ref: { type: 'string', description: 'Optional branch, tag or commit' }
+                ref: { type: 'string', description: 'Optional branch, tag or commit' },
+                start_line: { type: 'integer', description: 'Optional 1-based first line to return' },
+                end_line: { type: 'integer', description: 'Optional last line to return' }
             },
             required: ['path']
         }
     },
     {
         name: 'create_pull_request',
-        description: 'Creates a new branch, updates or creates one file, and opens a Pull Request (base defaults to main).',
+        description: 'Creates a new branch, changes one or more files, and opens ONE Pull Request (base defaults to main). Use "files": a list of {path, edits} to change several files at once (for example a Kotlin file and AndroidManifest.xml). Each edit is a {find, replace} snippet applied on the server; "find" must match the file exactly once. Only pass full "content" for new or small files.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -82,44 +84,132 @@ const TOOLS = [
                 repo: { type: 'string' },
                 base: { type: 'string' },
                 branch: { type: 'string' },
-                path: { type: 'string' },
-                content: { type: 'string' },
+                files: {
+                    type: 'array',
+                    description: 'Files to change in this PR',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            path: { type: 'string' },
+                            edits: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: { find: { type: 'string' }, replace: { type: 'string' } },
+                                    required: ['find', 'replace']
+                                }
+                            },
+                            content: { type: 'string', description: 'Full content (new or small files only)' }
+                        },
+                        required: ['path']
+                    }
+                },
+                path: { type: 'string', description: 'Single-file form: use "files" instead when changing several files' },
+                edits: {
+                    type: 'array',
+                    description: 'Find/replace edits applied in order to the existing file',
+                    items: {
+                        type: 'object',
+                        properties: { find: { type: 'string' }, replace: { type: 'string' } },
+                        required: ['find', 'replace']
+                    }
+                },
+                content: { type: 'string', description: 'Full new file content (only for new or small files)' },
                 commit_message: { type: 'string' },
                 pr_title: { type: 'string' }
             },
-            required: ['branch', 'path', 'content', 'commit_message', 'pr_title']
+            required: ['branch', 'commit_message', 'pr_title']
         }
     }
 ];
 
-async function getFileContents(args) {
-    const { owner, repo } = resolveRepo(args);
-    const path = args.path || '';
-    const base = `https://api.github.com/repos/${owner}/${repo}/contents/${encodePath(path)}`;
-    const url = args.ref ? `${base}?ref=${encodeURIComponent(args.ref)}` : base;
+const MAX_CHARS = 28000; // keeps each reply under the ~32000 chars Gemini shows before truncating
 
+function sliceText(text, args) {
+    const explicit = args.start_line !== undefined || args.end_line !== undefined;
+    if (!explicit && text.length <= MAX_CHARS) return text;
+
+    const lines = text.split('\n');
+    const total = lines.length;
+    const start = Math.min(Math.max(1, parseInt(args.start_line, 10) || 1), total);
+    let end = Math.min(parseInt(args.end_line, 10) || total, total);
+
+    let acc = 0, n = 0;
+    for (const l of lines.slice(start - 1, end)) {
+        if (n > 0 && acc + l.length + 1 > MAX_CHARS) break;
+        acc += l.length + 1;
+        n++;
+    }
+    end = start + n - 1;
+
+    const body = lines.slice(start - 1, end).join('\n');
+    const more = end < total ? `\n[More: call again with start_line=${end + 1}]` : '';
+    return `[lines ${start}-${end} of ${total}; ${text.length} chars in file]\n${body}${more}`;
+}
+
+// Reads one file as text plus its sha. Returns { ok: false, ... } if it does not exist.
+async function readFile(api, filePath, ref) {
+    const url = `${api}/contents/${filePath}${ref ? `?ref=${encodeURIComponent(ref)}` : ''}`;
     const { res, data } = await ghJson(url);
-    if (!res.ok) {
-        const hint = res.status === 404 ? ' (wrong path, or GITHUB_PAT cannot access this repo)' : '';
-        throw new Error(`GitHub ${res.status} for ${owner}/${repo}:${path} - ${data.message || 'error'}${hint}`);
-    }
-
-    if (Array.isArray(data)) {
-        return JSON.stringify(data.map(e => ({ name: e.name, path: e.path, type: e.type })), null, 2);
-    }
+    if (!res.ok) return { ok: false, status: res.status, message: data.message };
+    if (Array.isArray(data)) return { ok: true, isDir: true, entries: data };
     if (data.encoding === 'base64' && data.content) {
-        return Buffer.from(data.content, 'base64').toString('utf8');
+        return { ok: true, sha: data.sha, text: Buffer.from(data.content, 'base64').toString('utf8') };
     }
     // Files over 1 MB come back without inline content, so fetch them raw
     const raw = await fetch(url, { headers: ghHeaders('application/vnd.github.raw+json') });
     if (!raw.ok) throw new Error(`GitHub returned ${raw.status} for raw file`);
-    return await raw.text();
+    return { ok: true, sha: data.sha, text: await raw.text() };
+}
+
+async function getFileContents(args) {
+    const { owner, repo } = resolveRepo(args);
+    const path = args.path || '';
+    const api = `https://api.github.com/repos/${owner}/${repo}`;
+
+    const file = await readFile(api, encodePath(path), args.ref);
+    if (!file.ok) {
+        const hint = file.status === 404 ? ' (wrong path, or GITHUB_PAT cannot access this repo)' : '';
+        throw new Error(`GitHub ${file.status} for ${owner}/${repo}:${path} - ${file.message || 'error'}${hint}`);
+    }
+    if (file.isDir) {
+        return JSON.stringify(file.entries.map(e => ({ name: e.name, path: e.path, type: e.type })), null, 2);
+    }
+    return sliceText(file.text, args);
+}
+
+function applyEdits(original, edits) {
+    const crlf = original.includes('\r\n');
+    const norm = (s) => (crlf ? String(s).replace(/\r?\n/g, '\r\n') : String(s));
+    let text = original;
+    edits.forEach((e, i) => {
+        const label = `edit #${i + 1}`;
+        if (typeof e?.find !== 'string' || e.find === '') throw new Error(`${label}: "find" is required`);
+        const find = norm(e.find);
+        const count = text.split(find).length - 1;
+        if (count === 0) throw new Error(`${label}: "find" text not found. It must match the file exactly, including whitespace.`);
+        if (count > 1) throw new Error(`${label}: "find" matches ${count} places. Include more surrounding lines so it is unique.`);
+        // function form so "$" in Kotlin string templates is not treated as a replace pattern
+        text = text.replace(find, () => norm(e.replace ?? ''));
+    });
+    return text;
 }
 
 async function createPullRequest(args) {
     const { owner, repo } = resolveRepo(args);
     const api = `https://api.github.com/repos/${owner}/${repo}`;
     const baseBranch = args.base || 'main';
+    if (!args.branch) throw new Error('branch is required');
+
+    // Accept either a "files" list (several files in one PR) or the single path/edits/content form
+    const files = Array.isArray(args.files) && args.files.length
+        ? args.files
+        : [{ path: args.path, edits: args.edits, content: args.content }];
+    for (const f of files) {
+        if (!f?.path) throw new Error('every file needs a path');
+        const hasEdits = Array.isArray(f.edits) && f.edits.length > 0;
+        if (!hasEdits && typeof f.content !== 'string') throw new Error(`${f.path}: provide either "edits" or "content"`);
+    }
 
     const ref = await ghJson(`${api}/git/ref/heads/${encodeURIComponent(baseBranch)}`);
     if (!ref.res.ok) throw new Error(`Base branch "${baseBranch}": ${ref.data.message || ref.res.status}`);
@@ -131,17 +221,39 @@ async function createPullRequest(args) {
     // 422 = branch already exists, which is fine, we just commit onto it
     if (!mk.res.ok && mk.res.status !== 422) throw new Error(`Create branch: ${mk.data.message || mk.res.status}`);
 
-    const filePath = encodePath(args.path);
-    const existing = await ghJson(`${api}/contents/${filePath}?ref=${encodeURIComponent(args.branch)}`);
-    const putBody = {
-        message: args.commit_message,
-        content: Buffer.from(args.content, 'utf8').toString('base64'),
-        branch: args.branch
-    };
-    if (existing.res.ok && existing.data.sha) putBody.sha = existing.data.sha;
+    // Phase 1: work out every new file first, so a bad edit in any file commits nothing
+    const planned = [];
+    for (const f of files) {
+        const filePath = encodePath(f.path);
+        const existing = await readFile(api, filePath, args.branch);
+        if (existing.ok && existing.isDir) throw new Error(`${f.path} is a directory, not a file`);
 
-    const put = await ghJson(`${api}/contents/${filePath}`, { method: 'PUT', body: JSON.stringify(putBody) });
-    if (!put.res.ok) throw new Error(`Commit file: ${put.data.message || put.res.status}`);
+        let newContent;
+        if (Array.isArray(f.edits) && f.edits.length > 0) {
+            if (!existing.ok) throw new Error(`Cannot apply edits: ${f.path} does not exist on ${args.branch}`);
+            try {
+                newContent = applyEdits(existing.text, f.edits);
+            } catch (err) {
+                throw new Error(`${f.path}: ${err.message}`);
+            }
+            if (newContent === existing.text) throw new Error(`${f.path}: the edits produced no change`);
+        } else {
+            newContent = f.content;
+        }
+        planned.push({ path: f.path, filePath, newContent, sha: existing.ok ? existing.sha : undefined });
+    }
+
+    // Phase 2: commit each file to the branch
+    for (const p of planned) {
+        const putBody = {
+            message: planned.length > 1 ? `${args.commit_message} (${p.path})` : args.commit_message,
+            content: Buffer.from(p.newContent, 'utf8').toString('base64'),
+            branch: args.branch
+        };
+        if (p.sha) putBody.sha = p.sha;
+        const put = await ghJson(`${api}/contents/${p.filePath}`, { method: 'PUT', body: JSON.stringify(putBody) });
+        if (!put.res.ok) throw new Error(`Commit ${p.path}: ${put.data.message || put.res.status}`);
+    }
 
     const pr = await ghJson(`${api}/pulls`, {
         method: 'POST',
@@ -149,7 +261,7 @@ async function createPullRequest(args) {
     });
     if (!pr.res.ok) throw new Error(`Open PR: ${pr.data.message || pr.res.status}`);
 
-    return JSON.stringify({ status: 'PR created', url: pr.data.html_url, number: pr.data.number });
+    return JSON.stringify({ status: 'PR created', url: pr.data.html_url, number: pr.data.number, files: planned.map(p => p.path) });
 }
 
 // ---------- JSON-RPC handling ----------
