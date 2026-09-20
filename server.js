@@ -8,28 +8,27 @@ app.use(express.json({ limit: '50mb' }));
 
 let mcpProcess = null;
 
+// 1. Instant Health Checks so Gemini doesn't time out
+app.get('/', (req, res) => res.json({ status: "active" }));
+app.get('/mcp', (req, res) => res.json({ status: "active" }));
+
+// 2. The main SSE Stream
 app.get('/sse', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // 1. Tell Gemini where to send subsequent POST messages
     const proto = req.headers['x-forwarded-proto'] || req.protocol;
     const host = req.headers.host;
     res.write(`event: endpoint\ndata: ${proto}://${host}/message\n\n`);
 
-    // 2. Kill existing process if Gemini reconnects
     if (mcpProcess) mcpProcess.kill();
 
-    // 3. Boot the official GitHub MCP server
-    mcpProcess = spawn('npx', ['@modelcontextprotocol/server-github'], {
-        env: { 
-            ...process.env, 
-            GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_PAT 
-        }
+    // The Fix: '--no-install' forces it to instantly use the downloaded package
+    mcpProcess = spawn('npx', ['--no-install', '@modelcontextprotocol/server-github'], {
+        env: { ...process.env, GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_PAT }
     });
 
-    // 4. Stream official responses back to Gemini
     mcpProcess.stdout.on('data', (data) => {
         const lines = data.toString().split('\n');
         for (const line of lines) {
@@ -39,18 +38,16 @@ app.get('/sse', (req, res) => {
         }
     });
 
-    mcpProcess.stderr.on('data', (data) => console.error(`MCP Log: ${data}`));
+    mcpProcess.stderr.on('data', (data) => console.error(data.toString()));
     req.on('close', () => { if (mcpProcess) mcpProcess.kill(); });
 });
 
+// 3. Receive Messages from Gemini
 app.post('/message', (req, res) => {
-    if (!mcpProcess) return res.status(400).send('No active SSE connection');
-    
-    // Forward Gemini's JSON-RPC request to the official server
+    if (!mcpProcess) return res.status(400).send('No connection');
     mcpProcess.stdin.write(JSON.stringify(req.body) + '\n');
     res.send('ok');
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`GitHub MCP Bridge running on port ${PORT}`));
-
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Running on port ${PORT}`));
