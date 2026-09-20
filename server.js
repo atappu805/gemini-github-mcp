@@ -5,6 +5,11 @@ import crypto from 'node:crypto';
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+app.use((req, res, next) => {
+    // req.path has no query string, so MCP_SECRET never reaches the logs
+    res.on('finish', () => console.log(`${req.method} ${req.path} ${req.body?.method ?? ''} -> ${res.statusCode}`));
+    next();
+});
 
 // ---------- Config (set these in Render > Environment) ----------
 const GITHUB_PAT = process.env.GITHUB_PAT;                 // required
@@ -89,12 +94,15 @@ const TOOLS = [
 
 async function getFileContents(args) {
     const { owner, repo } = resolveRepo(args);
-    if (!args.path) throw new Error('path is required');
-    const base = `https://api.github.com/repos/${owner}/${repo}/contents/${encodePath(args.path)}`;
+    const path = args.path || '';
+    const base = `https://api.github.com/repos/${owner}/${repo}/contents/${encodePath(path)}`;
     const url = args.ref ? `${base}?ref=${encodeURIComponent(args.ref)}` : base;
 
     const { res, data } = await ghJson(url);
-    if (!res.ok) throw new Error(data.message || `GitHub returned ${res.status}`);
+    if (!res.ok) {
+        const hint = res.status === 404 ? ' (wrong path, or GITHUB_PAT cannot access this repo)' : '';
+        throw new Error(`GitHub ${res.status} for ${owner}/${repo}:${path} - ${data.message || 'error'}${hint}`);
+    }
 
     if (Array.isArray(data)) {
         return JSON.stringify(data.map(e => ({ name: e.name, path: e.path, type: e.type })), null, 2);
@@ -202,11 +210,23 @@ async function handleMessage(msg) {
 // ---------- Routes ----------
 app.get('/', (req, res) => res.json({ name: 'github-mcp-bridge', status: 'active' }));
 
+// Debug from a phone browser: /check?key=SECRET&path=app/src/main/java  (empty path = repo root)
+app.get('/check', async (req, res) => {
+    if (!isAuthorized(req)) return res.status(401).type('text/plain').send('Unauthorized');
+    try {
+        if (!GITHUB_PAT) throw new Error('GITHUB_PAT is not set on the server');
+        const text = await getFileContents({ path: req.query.path || '' });
+        res.type('text/plain').send(text.slice(0, 3000));
+    } catch (err) {
+        res.status(500).type('text/plain').send(err.message);
+    }
+});
+
 // This server has no SSE stream, so per the Streamable HTTP spec GET must be 405
 app.get('/mcp', (req, res) => res.status(405).set('Allow', 'POST').end());
 app.delete('/mcp', (req, res) => res.status(405).set('Allow', 'POST').end());
 
-app.post('/mcp', async (req, res) => {
+app.post(['/', '/mcp'], async (req, res) => {
     if (!isAuthorized(req)) {
         return res.status(401).json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: 'Unauthorized' } });
     }
