@@ -96,6 +96,87 @@ const TOOLS = [
         }
     },
     {
+        name: 'commit_files',
+        annotations: { title: 'Commit files to a branch', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        description: 'Commits changes to one or more files directly to an EXISTING branch as a single commit, with no pull request. Use "files": a list of {path, edits} where each edit is a {find, replace} snippet (each "find" must match exactly once). Committing to the default branch (main) only works if the server owner enabled it; otherwise use create_pull_request.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                owner: { type: 'string' },
+                repo: { type: 'string' },
+                branch: { type: 'string', description: 'Existing branch to commit to, for example main' },
+                files: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            path: { type: 'string' },
+                            edits: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: { find: { type: 'string' }, replace: { type: 'string' } },
+                                    required: ['find', 'replace']
+                                }
+                            },
+                            content: { type: 'string', description: 'Full content (new or small files only)' }
+                        },
+                        required: ['path']
+                    }
+                },
+                commit_message: { type: 'string' }
+            },
+            required: ['branch', 'files', 'commit_message']
+        }
+    },
+    {
+        name: 'run_workflow',
+        annotations: { title: 'Start a build', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        description: 'Starts a GitHub Actions workflow run (default: "Manual Test Build") on a branch. Returns the run_id. Then call get_build_status with wait_seconds=40 until it completes.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                owner: { type: 'string' },
+                repo: { type: 'string' },
+                workflow: { type: 'string', description: 'Workflow name, file name or id. Defaults to "Manual Test Build".' },
+                ref: { type: 'string', description: 'Branch to run on (default branch if omitted)' },
+                inputs: { type: 'object', description: 'Optional workflow_dispatch inputs' }
+            }
+        }
+    },
+    {
+        name: 'get_build_status',
+        annotations: { title: 'Check build status', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        description: 'Shows the status of a workflow run (latest run if run_id is omitted), with its jobs and failed steps. Set wait_seconds (max 40) to wait for it to finish before answering.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                owner: { type: 'string' },
+                repo: { type: 'string' },
+                run_id: { type: 'integer' },
+                workflow: { type: 'string', description: 'Only look at runs of this workflow' },
+                branch: { type: 'string', description: 'Only look at runs on this branch' },
+                wait_seconds: { type: 'integer', description: 'Wait up to this many seconds (max 40) for the run to complete' }
+            }
+        }
+    },
+    {
+        name: 'get_build_log',
+        annotations: { title: 'Read build errors', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        description: 'Reads the log of a FAILED run (the latest failed run if run_id is omitted) and returns the key compile errors with file paths and line numbers, plus the last lines. Use pattern (regex) or tail (line count) for a different view.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                owner: { type: 'string' },
+                repo: { type: 'string' },
+                run_id: { type: 'integer' },
+                branch: { type: 'string', description: 'Latest failed run on this branch' },
+                pattern: { type: 'string', description: 'Regex to search the log for' },
+                tail: { type: 'integer', description: 'Return only the last N lines' }
+            }
+        }
+    },
+    {
         name: 'create_pull_request',
         annotations: { title: 'Create pull request', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Creates a new branch, changes one or more files, and opens ONE Pull Request (base defaults to main). Use "files": a list of {path, edits} to change several files at once (for example a Kotlin file and AndroidManifest.xml). Each edit is a {find, replace} snippet applied on the server; "find" must match the file exactly once. Only pass full "content" for new or small files.',
@@ -341,6 +422,263 @@ async function searchCode(args) {
     return matches ? `${header}\n${out.join('\n')}` : `${header}\nNo matches.`;
 }
 
+// Works out the new content of every file (applies edits) without committing anything
+async function planFiles(api, files, branch) {
+    const planned = [];
+    for (const f of files) {
+        const filePath = encodePath(f.path);
+        const existing = await readFile(api, filePath, branch);
+        if (existing.ok && existing.isDir) throw new Error(`${f.path} is a directory, not a file`);
+
+        let newContent;
+        if (Array.isArray(f.edits) && f.edits.length > 0) {
+            if (!existing.ok) throw new Error(`Cannot apply edits: ${f.path} does not exist on ${branch}`);
+            try {
+                newContent = applyEdits(existing.text, f.edits);
+            } catch (err) {
+                throw new Error(`${f.path}: ${err.message}`);
+            }
+            if (newContent === existing.text) throw new Error(`${f.path}: the edits produced no change`);
+        } else {
+            if (typeof f.content !== 'string') throw new Error(`${f.path}: provide either "edits" or "content"`);
+            newContent = f.content;
+        }
+        planned.push({ path: f.path, filePath, newContent, sha: existing.ok ? existing.sha : undefined });
+    }
+    return planned;
+}
+
+// Commits changes straight to an EXISTING branch as ONE commit (no pull request)
+async function commitFiles(args) {
+    const { owner, repo } = resolveRepo(args);
+    const api = `https://api.github.com/repos/${owner}/${repo}`;
+    if (!args.branch) throw new Error('branch is required');
+    if (!args.commit_message) throw new Error('commit_message is required');
+    if (!Array.isArray(args.files) || !args.files.length) throw new Error('files is required');
+    for (const f of args.files) if (!f?.path) throw new Error('every file needs a path');
+
+    const info = await ghJson(api);
+    if (!info.res.ok) throw new Error(`Repo: ${info.data.message || info.res.status}`);
+    if (args.branch === info.data.default_branch && process.env.ALLOW_MAIN_COMMITS !== 'true') {
+        throw new Error(`Direct commits to "${args.branch}" are disabled on this server. Use create_pull_request, or ask the owner to set ALLOW_MAIN_COMMITS=true.`);
+    }
+
+    const ref = await ghJson(`${api}/git/ref/heads/${encodePath(args.branch)}`);
+    if (!ref.res.ok) throw new Error(`Branch "${args.branch}" not found (use create_pull_request to make a new branch)`);
+    const headSha = ref.data.object.sha;
+    const head = await ghJson(`${api}/git/commits/${headSha}`);
+    if (!head.res.ok) throw new Error(`Read head commit: ${head.data.message || head.res.status}`);
+
+    const planned = await planFiles(api, args.files, args.branch);
+
+    const tree = await ghJson(`${api}/git/trees`, {
+        method: 'POST',
+        body: JSON.stringify({
+            base_tree: head.data.tree.sha,
+            tree: planned.map(p => ({ path: p.path.replace(/^\/+/, ''), mode: '100644', type: 'blob', content: p.newContent }))
+        })
+    });
+    if (!tree.res.ok) throw new Error(`Create tree: ${tree.data.message || tree.res.status}`);
+
+    const commit = await ghJson(`${api}/git/commits`, {
+        method: 'POST',
+        body: JSON.stringify({ message: args.commit_message, tree: tree.data.sha, parents: [headSha] })
+    });
+    if (!commit.res.ok) throw new Error(`Create commit: ${commit.data.message || commit.res.status}`);
+
+    const upd = await ghJson(`${api}/git/refs/heads/${encodePath(args.branch)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ sha: commit.data.sha, force: false })
+    });
+    if (!upd.res.ok) throw new Error(`Update branch: ${upd.data.message || upd.res.status}`);
+
+    return JSON.stringify({
+        status: 'committed', branch: args.branch, sha: commit.data.sha,
+        url: `https://github.com/${owner}/${repo}/commit/${commit.data.sha}`,
+        files: planned.map(p => p.path)
+    });
+}
+
+// ---------- GitHub Actions (build) tools ----------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const DEFAULT_WORKFLOW = process.env.DEFAULT_WORKFLOW || 'Manual Test Build';
+
+async function resolveWorkflow(api, wanted) {
+    const key = String(wanted || DEFAULT_WORKFLOW).trim().toLowerCase();
+    const { res, data } = await ghJson(`${api}/actions/workflows?per_page=100`);
+    if (!res.ok) throw new Error(`List workflows: ${data.message || res.status}`);
+    const list = data.workflows || [];
+    const base = (p) => p.split('/').pop().toLowerCase();
+    const hit = list.find(w => String(w.id) === key)
+        || list.find(w => w.name.toLowerCase() === key)
+        || list.find(w => base(w.path) === key || base(w.path).replace(/\.ya?ml$/, '') === key);
+    if (!hit) {
+        throw new Error(`Workflow "${wanted || DEFAULT_WORKFLOW}" not found. Available: ${list.map(w => `"${w.name}" (${w.path})`).join(', ') || 'none'}`);
+    }
+    return hit;
+}
+
+const runSummary = (r) => ({
+    run_id: r.id, workflow: r.name, status: r.status, conclusion: r.conclusion,
+    branch: r.head_branch, commit: (r.head_sha || '').slice(0, 7), created: r.created_at, url: r.html_url
+});
+
+async function runWorkflow(args) {
+    const { owner, repo } = resolveRepo(args);
+    const api = `https://api.github.com/repos/${owner}/${repo}`;
+    const wf = await resolveWorkflow(api, args.workflow);
+
+    let ref = args.ref;
+    if (!ref) {
+        const info = await ghJson(api);
+        if (!info.res.ok) throw new Error(`Repo: ${info.data.message || info.res.status}`);
+        ref = info.data.default_branch;
+    }
+
+    const startedAt = Date.now();
+    const disp = await fetch(`${api}/actions/workflows/${wf.id}/dispatches`, {
+        method: 'POST', headers: ghHeaders(), body: JSON.stringify({ ref, inputs: args.inputs || {} })
+    });
+    if (disp.status !== 204) {
+        const d = await disp.json().catch(() => ({}));
+        const hint = [404, 422].includes(disp.status) ? ' (check the branch name, that the workflow has a workflow_dispatch trigger on it, and any required inputs)' : '';
+        throw new Error(`Dispatch "${wf.name}" on ${ref}: ${d.message || disp.status}${hint}`);
+    }
+
+    // dispatch returns no run id, so look for the run that just appeared
+    for (let i = 0; i < 8; i++) {
+        await sleep(2000);
+        const { res, data } = await ghJson(`${api}/actions/workflows/${wf.id}/runs?event=workflow_dispatch&branch=${encodeURIComponent(ref)}&per_page=5`);
+        const run = res.ok && (data.workflow_runs || []).find(r => Date.parse(r.created_at) >= startedAt - 30000);
+        if (run) {
+            return JSON.stringify({ status: 'started', ...runSummary(run), next: 'Call get_build_status with this run_id and wait_seconds=40 until it completes.' });
+        }
+    }
+    return JSON.stringify({ status: 'dispatched', workflow: wf.name, ref, note: 'Run not visible yet. Call get_build_status in a few seconds.' });
+}
+
+async function getRun(api, args) {
+    if (args.run_id) {
+        const { res, data } = await ghJson(`${api}/actions/runs/${encodeURIComponent(args.run_id)}`);
+        if (!res.ok) throw new Error(`Run ${args.run_id}: ${data.message || res.status}`);
+        return data;
+    }
+    let base = `${api}/actions/runs`;
+    if (args.workflow) base = `${api}/actions/workflows/${(await resolveWorkflow(api, args.workflow)).id}/runs`;
+    let url = `${base}?per_page=5`;
+    if (args.branch) url += `&branch=${encodeURIComponent(args.branch)}`;
+    if (args.status) url += `&status=${encodeURIComponent(args.status)}`;
+    const { res, data } = await ghJson(url);
+    if (!res.ok) throw new Error(`List runs: ${data.message || res.status}`);
+    const run = (data.workflow_runs || [])[0];
+    if (!run) throw new Error('No matching workflow runs found');
+    return run;
+}
+
+async function getJobs(api, runId) {
+    const { data } = await ghJson(`${api}/actions/runs/${runId}/jobs?per_page=30`);
+    return data.jobs || [];
+}
+
+async function getBuildStatus(args) {
+    const { owner, repo } = resolveRepo(args);
+    const api = `https://api.github.com/repos/${owner}/${repo}`;
+    let run = await getRun(api, args);
+
+    const wait = Math.min(Math.max(parseInt(args.wait_seconds, 10) || 0, 0), 40);
+    const deadline = Date.now() + wait * 1000;
+    while (run.status !== 'completed' && Date.now() < deadline) {
+        await sleep(4000);
+        run = await getRun(api, { run_id: run.id });
+    }
+
+    const jobs = (await getJobs(api, run.id)).map(j => ({
+        id: j.id, name: j.name, status: j.status, conclusion: j.conclusion,
+        failed_steps: (j.steps || []).filter(s => s.conclusion === 'failure').map(s => s.name),
+        current_step: j.status === 'in_progress' ? (j.steps || []).find(s => s.status === 'in_progress')?.name : undefined
+    }));
+    const hint = run.status !== 'completed' ? 'Still running. Call again with wait_seconds=40.'
+        : run.conclusion === 'success' ? 'Build passed.'
+        : 'Build did not pass. Call get_build_log to see the errors.';
+    return JSON.stringify({ ...runSummary(run), jobs, hint }, null, 2);
+}
+
+// GitHub masks secret values in logs as ***, which can hide part of a file path.
+// Rebuild those paths by matching them against the real files in the repo.
+async function unmaskPaths(lines, owner, repo, ref) {
+    if (!lines.some(l => l.includes('***'))) return lines;
+    let files;
+    try { files = await loadRepoFiles(owner, repo, ref); } catch { return lines; }
+    const paths = files.map(f => f.path);
+    const memo = new Map();
+    const resolve = (tok) => {
+        if (memo.has(tok)) return memo.get(tok);
+        const re = new RegExp('^' + tok.split('***').map(x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[^/]+') + '$');
+        const m = paths.filter(p => re.test(p));
+        const out = m.length === 1 ? m[0] : tok;
+        memo.set(tok, out);
+        return out;
+    };
+    return lines.map(l => l.replace(/[\w./*-]*\*\*\*[\w./*-]*\.(?:kt|kts|java|xml|gradle)\b/g, resolve));
+}
+
+const LOG_TS = /^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z\s?/;
+const LOG_ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
+const LOG_ERR = /(^|\s)e: |##\[error\]|FAILURE:|What went wrong|Execution failed|Caused by:|\berror:|> Task \S+ FAILED|Unresolved reference|Exception\b/;
+
+async function getBuildLog(args) {
+    const { owner, repo } = resolveRepo(args);
+    const api = `https://api.github.com/repos/${owner}/${repo}`;
+    const run = await getRun(api, args.run_id ? args : { ...args, status: args.status || 'failure' });
+    if (run.status !== 'completed') return JSON.stringify({ ...runSummary(run), hint: 'This run is not finished yet. Use get_build_status with wait_seconds=40.' });
+
+    const jobs = await getJobs(api, run.id);
+    let targets = jobs.filter(j => j.conclusion === 'failure');
+    if (!targets.length) targets = jobs.filter(j => j.conclusion && j.conclusion !== 'success' && j.conclusion !== 'skipped');
+    if (!targets.length) return JSON.stringify({ ...runSummary(run), hint: 'No failed jobs in this run.' });
+
+    const out = [`[run ${run.id} on ${run.head_branch} @ ${(run.head_sha || '').slice(0, 7)}: ${run.conclusion}]`];
+    for (const job of targets.slice(0, 2)) {
+        const lr = await fetch(`${api}/actions/jobs/${job.id}/logs`, { headers: ghHeaders() });
+        if (!lr.ok) throw new Error(`Job log ${lr.status} (does the token have Actions read access?)`);
+        const lines = (await lr.text()).split('\n').map(l =>
+            l.replace(LOG_TS, '').replace(LOG_ANSI, '').replace(/\r$/, '')
+             .replace(/file:\/\/\/home\/runner\/work\/[^/]+\/[^/]+\//g, ''));
+
+        const failedSteps = (job.steps || []).filter(s => s.conclusion === 'failure').map(s => s.name).join(', ');
+        out.push(`--- job "${job.name}"${failedSteps ? `, failed step: ${failedSteps}` : ''} (${lines.length} log lines) ---`);
+
+        if (args.pattern) {
+            let re;
+            try { re = new RegExp(args.pattern, 'i'); } catch (e) { throw new Error(`Invalid regex: ${e.message}`); }
+            let n = 0;
+            for (let i = 0; i < lines.length && n < 80; i++) {
+                if (re.test(lines[i])) { n++; out.push(`${i + 1}: ${lines[i].slice(0, 300)}`); }
+            }
+            if (!n) out.push('No lines matched.');
+        } else if (args.tail) {
+            const t = Math.min(Math.max(parseInt(args.tail, 10) || 40, 1), 300);
+            lines.slice(-t).forEach(l => out.push(l.slice(0, 300)));
+        } else {
+            const keep = new Set();
+            lines.forEach((l, i) => {
+                if (/^w: /.test(l) || !LOG_ERR.test(l)) return;
+                keep.add(i);
+                if (/What went wrong/.test(l)) for (let k = 1; k <= 3; k++) keep.add(i + k);
+            });
+            out.push('KEY ERRORS:');
+            [...keep].filter(i => i < lines.length).slice(0, 60).forEach(i => out.push(`${i + 1}: ${lines[i].slice(0, 300)}`));
+            if (!keep.size) out.push('(no error lines recognised, see the tail below)');
+            out.push('LAST 25 LINES:');
+            lines.slice(-25).forEach(l => out.push(l.slice(0, 300)));
+        }
+    }
+    const fixed = await unmaskPaths(out, owner, repo, run.head_branch);
+    let text = fixed.join('\n');
+    if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS) + '\n[output truncated, use pattern or tail to narrow]';
+    return text;
+}
+
 async function createPullRequest(args) {
     const { owner, repo } = resolveRepo(args);
     const api = `https://api.github.com/repos/${owner}/${repo}`;
@@ -357,7 +695,7 @@ async function createPullRequest(args) {
         if (!hasEdits && typeof f.content !== 'string') throw new Error(`${f.path}: provide either "edits" or "content"`);
     }
 
-    const ref = await ghJson(`${api}/git/ref/heads/${encodeURIComponent(baseBranch)}`);
+    const ref = await ghJson(`${api}/git/ref/heads/${encodePath(baseBranch)}`);
     if (!ref.res.ok) throw new Error(`Base branch "${baseBranch}": ${ref.data.message || ref.res.status}`);
 
     const mk = await ghJson(`${api}/git/refs`, {
@@ -368,26 +706,7 @@ async function createPullRequest(args) {
     if (!mk.res.ok && mk.res.status !== 422) throw new Error(`Create branch: ${mk.data.message || mk.res.status}`);
 
     // Phase 1: work out every new file first, so a bad edit in any file commits nothing
-    const planned = [];
-    for (const f of files) {
-        const filePath = encodePath(f.path);
-        const existing = await readFile(api, filePath, args.branch);
-        if (existing.ok && existing.isDir) throw new Error(`${f.path} is a directory, not a file`);
-
-        let newContent;
-        if (Array.isArray(f.edits) && f.edits.length > 0) {
-            if (!existing.ok) throw new Error(`Cannot apply edits: ${f.path} does not exist on ${args.branch}`);
-            try {
-                newContent = applyEdits(existing.text, f.edits);
-            } catch (err) {
-                throw new Error(`${f.path}: ${err.message}`);
-            }
-            if (newContent === existing.text) throw new Error(`${f.path}: the edits produced no change`);
-        } else {
-            newContent = f.content;
-        }
-        planned.push({ path: f.path, filePath, newContent, sha: existing.ok ? existing.sha : undefined });
-    }
+    const planned = await planFiles(api, files, args.branch);
 
     // Phase 2: commit each file to the branch
     for (const p of planned) {
@@ -451,6 +770,10 @@ async function handleMessage(msg) {
                     if (name === 'get_file_contents') text = await getFileContents(args);
                     else if (name === 'create_pull_request') text = await createPullRequest(args);
                     else if (name === 'search_code') text = await searchCode(args);
+                    else if (name === 'commit_files') text = await commitFiles(args);
+                    else if (name === 'run_workflow') text = await runWorkflow(args);
+                    else if (name === 'get_build_status') text = await getBuildStatus(args);
+                    else if (name === 'get_build_log') text = await getBuildLog(args);
                     else throw new Error(`Unknown tool: ${name}`);
                     return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } };
                 } catch (err) {
@@ -504,3 +827,4 @@ app.listen(PORT, () => {
     if (!GITHUB_PAT) console.warn('WARNING: GITHUB_PAT is not set');
     if (!MCP_SECRET) console.warn('WARNING: MCP_SECRET is not set, /mcp is open to anyone with the URL');
 });
+            
