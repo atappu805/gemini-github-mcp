@@ -62,6 +62,7 @@ async function ghJson(url, options = {}) {
 const TOOLS = [
     {
         name: 'get_file_contents',
+        annotations: { title: 'Read file', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
         description: 'Reads a file (or lists a directory) in a GitHub repository. Large files are returned in chunks of about 28000 characters: use start_line and end_line to read further.',
         inputSchema: {
             type: 'object',
@@ -78,6 +79,7 @@ const TOOLS = [
     },
     {
         name: 'search_code',
+        annotations: { title: 'Search code', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
         description: 'Regex search across all text source files of the repo (like grep -rn). Returns "path:line: text". Use it to find where something is defined or used BEFORE reading files. Combine several terms in one call with |, for example "SmartImage|AsyncImage". Optional include narrows to paths containing a substring.',
         inputSchema: {
             type: 'object',
@@ -95,6 +97,7 @@ const TOOLS = [
     },
     {
         name: 'create_pull_request',
+        annotations: { title: 'Create pull request', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Creates a new branch, changes one or more files, and opens ONE Pull Request (base defaults to main). Use "files": a list of {path, edits} to change several files at once (for example a Kotlin file and AndroidManifest.xml). Each edit is a {find, replace} snippet applied on the server; "find" must match the file exactly once. Only pass full "content" for new or small files.',
         inputSchema: {
             type: 'object',
