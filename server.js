@@ -177,6 +177,49 @@ const TOOLS = [
         }
     },
     {
+        name: 'preview_bulk_rename',
+        annotations: { title: 'Preview a repo-wide rename', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        description: 'DRY RUN of a repo-wide package/text rename. Rules {find, replace} are applied to file contents (dotted form) and to file paths (dotted and slash form, so folders move). Changes nothing. Returns counts, folders that would move, config-file lines that would change, and lines that mention words you list in also_report. Rules run in order.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                owner: { type: 'string' },
+                repo: { type: 'string' },
+                base: { type: 'string', description: 'Branch to read (default branch if omitted)' },
+                replacements: {
+                    type: 'array',
+                    items: { type: 'object', properties: { find: { type: 'string' }, replace: { type: 'string' } }, required: ['find', 'replace'] }
+                },
+                skip_paths: { type: 'array', items: { type: 'string' }, description: 'Leave files whose path contains any of these untouched, for example "app/build.gradle.kts"' },
+                also_report: { type: 'array', items: { type: 'string' }, description: 'Words to list if they still appear after the rename' }
+            },
+            required: ['replacements']
+        }
+    },
+    {
+        name: 'apply_bulk_rename',
+        annotations: { title: 'Apply a repo-wide rename', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        description: 'Applies the same rename as preview_bulk_rename on a NEW branch as one commit (files are moved by reference, nothing is retyped) and opens a pull request. Run preview_bulk_rename first.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                owner: { type: 'string' },
+                repo: { type: 'string' },
+                base: { type: 'string', description: 'Branch to start from (default branch if omitted)' },
+                branch: { type: 'string', description: 'NEW branch name to create' },
+                replacements: {
+                    type: 'array',
+                    items: { type: 'object', properties: { find: { type: 'string' }, replace: { type: 'string' } }, required: ['find', 'replace'] }
+                },
+                skip_paths: { type: 'array', items: { type: 'string' } },
+                commit_message: { type: 'string' },
+                pr_title: { type: 'string' },
+                open_pr: { type: 'boolean', description: 'Open a pull request (default true)' }
+            },
+            required: ['branch', 'replacements']
+        }
+    },
+    {
         name: 'create_pull_request',
         annotations: { title: 'Create pull request', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description: 'Creates a new branch, changes one or more files, and opens ONE Pull Request (base defaults to main). Use "files": a list of {path, edits} to change several files at once (for example a Kotlin file and AndroidManifest.xml). Each edit is a {find, replace} snippet applied on the server; "find" must match the file exactly once. Only pass full "content" for new or small files.',
@@ -299,7 +342,7 @@ function applyEdits(original, edits) {
 }
 
 // ---------- Repo-wide search (like grep -rn) ----------
-const TEXT_EXT = /\.(kt|kts|java|xml|gradle|json|md|toml|properties|pro|txt|yml|yaml|cfg)$/i;
+const TEXT_EXT = /\.(kt|kts|java|xml|gradle|json|md|toml|properties|pro|txt|yml|yaml|cfg|aidl|proto|html|js|sh|bat|cmake|cpp|h)$/i;
 const SKIP_DIR = /(^|\/)(build|\.gradle|\.git|node_modules)\//;
 const MAX_FILE_BYTES = 1024 * 1024;
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -679,6 +722,190 @@ async function getBuildLog(args) {
     return text;
 }
 
+// ---------- Bulk rename (package rename across the whole repo, done server-side) ----------
+// Each rule {find, replace} is applied to file CONTENTS (dotted form only, so URLs like
+// github.com/name are never touched) and to file PATHS (dotted form and slash form, so the
+// folders move too). Files are moved by reusing their git blob, so nothing is retyped.
+function pathVariants(find, replace) {
+    const pairs = [[find, replace]];
+    const f2 = find.replace(/\./g, '/'), r2 = replace.replace(/\./g, '/');
+    if (f2 !== find) pairs.push([f2, r2]);
+    return pairs;
+}
+function applyPathRules(path, reps) {
+    let p = path;
+    for (const { find, replace } of reps) for (const [f, r] of pathVariants(find, replace)) p = p.split(f).join(r);
+    return p;
+}
+function applyContentRules(text, reps) {
+    let t = text;
+    for (const { find, replace } of reps) if (t.includes(find)) t = t.split(find).join(replace);
+    return t;
+}
+
+async function planBulkRename(args) {
+    const { owner, repo } = resolveRepo(args);
+    const api = `https://api.github.com/repos/${owner}/${repo}`;
+    const reps = (Array.isArray(args.replacements) ? args.replacements : [])
+        .filter(r => r && typeof r.find === 'string' && r.find && typeof r.replace === 'string');
+    if (!reps.length) throw new Error('replacements is required: a list of {find, replace}, for example {"find":"com.old","replace":"com.new"}');
+    const skip = (Array.isArray(args.skip_paths) ? args.skip_paths : []).map(String).filter(Boolean);
+
+    let base = args.base;
+    if (!base) {
+        const info = await ghJson(api);
+        if (!info.res.ok) throw new Error(`Repo: ${info.data.message || info.res.status}`);
+        base = info.data.default_branch;
+    }
+    const ref = await ghJson(`${api}/git/ref/heads/${encodePath(base)}`);
+    if (!ref.res.ok) throw new Error(`Base branch "${base}": ${ref.data.message || ref.res.status}`);
+    const headSha = ref.data.object.sha;
+    const head = await ghJson(`${api}/git/commits/${headSha}`);
+    if (!head.res.ok) throw new Error(`Read head commit: ${head.data.message || head.res.status}`);
+    const treeSha = head.data.tree.sha;
+    const tree = await ghJson(`${api}/git/trees/${treeSha}?recursive=1`);
+    if (!tree.res.ok) throw new Error(`Read file list: ${tree.data.message || tree.res.status}`);
+    if (tree.data.truncated) throw new Error('The repo file list is too large for this tool');
+    const entries = tree.data.tree.filter(e => e.type === 'blob');
+    const existing = new Set(entries.map(e => e.path));
+
+    const files = await loadRepoFiles(owner, repo, base);
+    const textByPath = new Map(files.map(f => [f.path, f]));
+
+    const changes = [];
+    const targets = new Set();
+    for (const e of entries) {
+        if (e.mode === '120000' || e.mode === '160000') continue; // symlinks and submodules
+        if (skip.some(s => e.path.includes(s))) continue;
+        const newPath = applyPathRules(e.path, reps);
+        const tf = textByPath.get(e.path);
+        let newText = null;
+        if (tf) {
+            const old = tf.lines.join('\n');
+            const t = applyContentRules(old, reps);
+            if (t !== old) newText = t;
+        }
+        if (newPath === e.path && newText === null) continue;
+        if (newPath !== e.path && existing.has(newPath)) throw new Error(`Collision: ${e.path} would move onto the existing file ${newPath}`);
+        if (targets.has(newPath)) throw new Error(`Collision: two files would both become ${newPath}`);
+        targets.add(newPath);
+        changes.push({ path: e.path, newPath, mode: e.mode, sha: e.sha, newText });
+    }
+    return { owner, repo, api, reps, base, headSha, treeSha, changes, textByPath, skip };
+}
+
+async function previewBulkRename(args) {
+    const plan = await planBulkRename(args);
+    const { changes, textByPath, reps } = plan;
+    const moved = changes.filter(c => c.newPath !== c.path);
+    const edited = changes.filter(c => c.newText !== null);
+
+    const dirPairs = new Map();
+    for (const c of moved) {
+        const od = c.path.split('/').slice(0, -1).join('/'), nd = c.newPath.split('/').slice(0, -1).join('/');
+        if (!dirPairs.has(od)) dirPairs.set(od, nd);
+    }
+    const isSrc = (p) => /\.(kt|java)$/.test(p);
+    const config = [], literals = [];
+    for (const c of edited) {
+        const lines = textByPath.get(c.path).lines;
+        let perFile = 0;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].replace(/\r$/, '');
+            if (!reps.some(r => line.includes(r.find))) continue;
+            if (!isSrc(c.path)) { if (perFile++ < 3) config.push(`${c.path}:${i + 1}: ${line.slice(0, 200)}`); }
+            else if (!/^\s*(package|import|@file:)/.test(line)) literals.push(`${c.path}:${i + 1}: ${line.trim().slice(0, 200)}`);
+        }
+    }
+    const leftovers = [];
+    const words = (Array.isArray(args.also_report) ? args.also_report : []).map(String).filter(Boolean);
+    if (words.length) {
+        const changed = new Map(changes.map(c => [c.path, c.newText]));
+        for (const [p, f] of textByPath) {
+            if (plan.skip.some(s => p.includes(s))) continue;
+            const text = changed.get(p) ?? null;
+            const lines = text !== null ? text.split('\n') : f.lines;
+            for (let i = 0; i < lines.length && leftovers.length < 40; i++) {
+                if (words.some(w => lines[i].includes(w))) leftovers.push(`${p}:${i + 1}: ${lines[i].replace(/\r$/, '').trim().slice(0, 200)}`);
+            }
+        }
+    }
+
+    const out = [
+        `[PREVIEW on ${plan.base} @ ${plan.headSha.slice(0, 7)}. Nothing was changed.]`,
+        `files with edited contents: ${edited.length}`,
+        `files that would move to a new path: ${moved.length}`,
+        `folders that move (old -> new, first 12 of ${dirPairs.size}):`,
+        ...[...dirPairs].slice(0, 12).map(([o, n]) => `  ${o} -> ${n}`),
+        `NON-Kotlin/Java files whose contents change (check these, for example applicationId, authorities, workflow paths):`,
+        ...(config.length ? config.slice(0, 50) : ['  none']),
+        `Kotlin/Java lines that are NOT package/import lines (string literals, comments):`,
+        ...(literals.length ? literals.slice(0, 30) : ['  none']),
+    ];
+    if (words.length) out.push(`STILL CONTAINS ${words.map(w => `"${w}"`).join(', ')} after the rename (left as is):`, ...(leftovers.length ? leftovers : ['  none']));
+    let text = out.join('\n');
+    if (text.length > MAX_CHARS) text = text.slice(0, MAX_CHARS) + '\n[output truncated]';
+    return text;
+}
+
+async function applyBulkRename(args) {
+    if (!args.branch) throw new Error('branch is required: the NEW branch to create');
+    const plan = await planBulkRename(args);
+    if (!plan.changes.length) throw new Error('Nothing to change: no file matched the replacements');
+    const { api, changes } = plan;
+
+    const mk = await ghJson(`${api}/git/refs`, { method: 'POST', body: JSON.stringify({ ref: `refs/heads/${args.branch}`, sha: plan.headSha }) });
+    if (!mk.res.ok) throw new Error(`Create branch "${args.branch}": ${mk.data.message || mk.res.status} (use a branch name that does not exist yet)`);
+
+    try {
+        const entries = [];
+        for (const c of changes) {
+            if (c.newPath !== c.path) entries.push({ path: c.path, mode: c.mode, type: 'blob', sha: null }); // delete old path
+            entries.push(c.newText !== null
+                ? { path: c.newPath, mode: c.mode, type: 'blob', content: c.newText }
+                : { path: c.newPath, mode: c.mode, type: 'blob', sha: c.sha });
+        }
+
+        // build the new tree in small batches, each one on top of the previous
+        let baseTree = plan.treeSha, batch = [], bytes = 0;
+        const flush = async () => {
+            if (!batch.length) return;
+            const t = await ghJson(`${api}/git/trees`, { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree: batch }) });
+            if (!t.res.ok) throw new Error(`Create tree: ${t.data.message || t.res.status}`);
+            baseTree = t.data.sha; batch = []; bytes = 0;
+        };
+        for (const e of entries) {
+            batch.push(e);
+            bytes += e.content ? Buffer.byteLength(e.content) : 200;
+            if (batch.length >= 80 || bytes > 3000000) await flush();
+        }
+        await flush();
+
+        const message = args.commit_message || 'Rename packages';
+        const commit = await ghJson(`${api}/git/commits`, { method: 'POST', body: JSON.stringify({ message, tree: baseTree, parents: [plan.headSha] }) });
+        if (!commit.res.ok) throw new Error(`Create commit: ${commit.data.message || commit.res.status}`);
+        const upd = await ghJson(`${api}/git/refs/heads/${encodePath(args.branch)}`, { method: 'PATCH', body: JSON.stringify({ sha: commit.data.sha, force: false }) });
+        if (!upd.res.ok) throw new Error(`Update branch: ${upd.data.message || upd.res.status}`);
+
+        const result = {
+            status: 'renamed', branch: args.branch, commit: commit.data.sha.slice(0, 7),
+            files_edited: changes.filter(c => c.newText !== null).length,
+            files_moved: changes.filter(c => c.newPath !== c.path).length
+        };
+        if (args.open_pr !== false) {
+            const pr = await ghJson(`${api}/pulls`, {
+                method: 'POST',
+                body: JSON.stringify({ title: args.pr_title || message, body: 'Automated package rename.', head: args.branch, base: plan.base })
+            });
+            if (!pr.res.ok) throw new Error(`Open PR: ${pr.data.message || pr.res.status}`);
+            result.pr_url = pr.data.html_url;
+        }
+        return JSON.stringify(result);
+    } catch (err) {
+        throw new Error(`${err.message}. The branch "${args.branch}" was created but may be incomplete: use a different branch name for the next try.`);
+    }
+}
+
 async function createPullRequest(args) {
     const { owner, repo } = resolveRepo(args);
     const api = `https://api.github.com/repos/${owner}/${repo}`;
@@ -774,6 +1001,8 @@ async function handleMessage(msg) {
                     else if (name === 'run_workflow') text = await runWorkflow(args);
                     else if (name === 'get_build_status') text = await getBuildStatus(args);
                     else if (name === 'get_build_log') text = await getBuildLog(args);
+                    else if (name === 'preview_bulk_rename') text = await previewBulkRename(args);
+                    else if (name === 'apply_bulk_rename') text = await applyBulkRename(args);
                     else throw new Error(`Unknown tool: ${name}`);
                     return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } };
                 } catch (err) {
@@ -827,4 +1056,4 @@ app.listen(PORT, () => {
     if (!GITHUB_PAT) console.warn('WARNING: GITHUB_PAT is not set');
     if (!MCP_SECRET) console.warn('WARNING: MCP_SECRET is not set, /mcp is open to anyone with the URL');
 });
-            
+    
