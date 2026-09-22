@@ -9,12 +9,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
     // req.path has no query string, so MCP_SECRET never reaches the logs
-    const started = Date.now();
-    res.on('finish', () => {
-        const tool = req.body?.method === 'tools/call' ? ` ${req.body?.params?.name ?? ''}` : '';
-        const note = res.locals?.note ? ` | ${res.locals.note}` : '';
-        console.log(`${req.method} ${req.path} ${req.body?.method ?? ''}${tool} -> ${res.statusCode} (${Date.now() - started}ms)${note}`);
-    });
+    res.on('finish', () => console.log(`${req.method} ${req.path} ${req.body?.method ?? ''} -> ${res.statusCode}`));
     next();
 });
 
@@ -226,75 +221,18 @@ const TOOLS = [
     },
     {
         name: 'list_recent_commits',
-        annotations: { title: 'List commits', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Lists recent commits on a branch, each with sha, author, date and message. Use get_commit for the files a specific commit touched.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, branch: { type: 'string' }, path: { type: 'string', description: 'Only commits touching this file or folder' }, author: { type: 'string' }, limit: { type: 'integer' } } }
-    },
-    {
-        name: 'get_commit',
-        annotations: { title: 'Read a commit', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Shows one commit: message, stats, and the files it changed with additions/deletions.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, sha: { type: 'string' } }, required: ['sha'] }
-    },
-    {
-        name: 'list_branches',
-        annotations: { title: 'List branches', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Lists every branch with its last commit sha, and how far ahead/behind the default branch it is. Use this to find stale branches to clean up.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' } } }
-    },
-    {
-        name: 'delete_branch',
-        annotations: { title: 'Delete a branch', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-        description: 'Deletes a branch. Refuses on the default branch (main).',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, branch: { type: 'string' } }, required: ['branch'] }
-    },
-    {
-        name: 'list_pull_requests',
-        annotations: { title: 'List pull requests', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Lists pull requests (open by default) with number, title, state, branch and mergeable_state.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string', description: 'open, closed or all' }, base: { type: 'string' }, limit: { type: 'integer' } } }
-    },
-    {
-        name: 'get_pull_request_files',
-        annotations: { title: 'List files in a pull request', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Shows a pull request branch, mergeable state, and the files it changes with additions/deletions (no diff text). Use get_file_contents on the PR branch to read a file.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, number: { type: 'integer' } }, required: ['number'] }
-    },
-    {
-        name: 'merge_pull_request',
-        annotations: { title: 'Merge a pull request', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-        description: 'Merges a pull request. Merging into the default branch (main) only works if the server owner enabled direct main writes.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, number: { type: 'integer' }, merge_method: { type: 'string', description: 'merge, squash or rebase (default merge)' }, commit_title: { type: 'string' } }, required: ['number'] }
-    },
-    {
-        name: 'list_issues',
-        annotations: { title: 'List issues', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Lists issues (open by default, pull requests excluded).',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, state: { type: 'string' }, labels: { type: 'string', description: 'Comma-separated label names' }, limit: { type: 'integer' } } }
-    },
-    {
-        name: 'create_issue',
-        annotations: { title: 'Create an issue', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-        description: 'Opens a new issue.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, labels: { type: 'array', items: { type: 'string' } } }, required: ['title'] }
-    },
-    {
-        name: 'add_comment',
-        annotations: { title: 'Comment on an issue or PR', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-        description: 'Adds a comment to an issue or a pull request (pull requests are numbered the same way).',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, number: { type: 'integer' }, body: { type: 'string' } }, required: ['number', 'body'] }
-    },
-    {
-        name: 'list_releases',
-        annotations: { title: 'List releases', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Lists releases with tag, name, draft/prerelease flags and publish date.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, limit: { type: 'integer' } } }
-    },
-    {
-        name: 'list_workflow_runs',
-        annotations: { title: 'List workflow runs', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-        description: 'Lists recent GitHub Actions runs (any workflow, or one named workflow) with status, conclusion and branch. Use get_build_log to read a failing run errors.',
-        inputSchema: { type: 'object', properties: { owner: { type: 'string' }, repo: { type: 'string' }, workflow: { type: 'string' }, branch: { type: 'string' }, status: { type: 'string' }, limit: { type: 'integer' } } }
+        annotations: { title: 'List recent commits', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        description: 'Lists recent commits on a branch with author, message, date, and which files each commit touched (added/modified/removed, with added/deleted line counts), so Spark can see history without paging through diffs. Optionally filter to commits that touched a given path.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                owner: { type: 'string' },
+                repo: { type: 'string' },
+                branch: { type: 'string', description: 'Branch, tag or commit to list from (default branch if omitted)' },
+                path: { type: 'string', description: 'Only commits that touched this file or folder' },
+                limit: { type: 'integer', description: 'Number of commits to return (default 10, max 30)' }
+            }
+        }
     },
     {
         name: 'create_pull_request',
@@ -424,7 +362,7 @@ const SKIP_DIR = /(^|\/)(build|\.gradle|\.git|node_modules)\//;
 const MAX_FILE_BYTES = 1024 * 1024;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_CHARS = 60 * 1000 * 1000;
-let repoCache = null; // { key, time, files: [{ path, text }] }
+let repoCache = null; // { key, time, files: [{ path, lines }] }
 
 function parsePax(buf) {
     const out = {};
@@ -495,7 +433,7 @@ async function loadRepoFiles(owner, repo, ref) {
         if ((type === '0' || type === '\0') && TEXT_EXT.test(path) && !SKIP_DIR.test(path) && size <= MAX_FILE_BYTES) {
             const text = (await read(padded)).subarray(0, size).toString('utf8');
             chars += text.length;
-            files.push({ path, text });
+            files.push({ path, lines: text.split('\n') });
         } else {
             await skip(padded);
         }
@@ -509,8 +447,7 @@ async function searchCode(args) {
     if (!args.pattern) throw new Error('pattern is required');
     if (String(args.pattern).length > 300) throw new Error('pattern is too long');
     let re;
-    let reAll;
-    try { const fl = args.ignore_case === false ? '' : 'i'; re = new RegExp(args.pattern, fl); reAll = new RegExp(args.pattern, fl + 'm'); }
+    try { re = new RegExp(args.pattern, args.ignore_case === false ? '' : 'i'); }
     catch (e) { throw new Error(`Invalid regex: ${e.message}`); }
 
     const ctx = Math.min(Math.max(parseInt(args.context, 10) || 0, 0), 3);
@@ -524,17 +461,15 @@ async function searchCode(args) {
     outer:
     for (const f of files) {
         if (include && !f.path.toLowerCase().includes(include)) continue;
-        if (!reAll.test(f.text)) continue;
-        const fl = f.text.split('\n');
         let hitThisFile = false;
-        for (let i = 0; i < fl.length; i++) {
-            if (!re.test(fl[i])) continue;
+        for (let i = 0; i < f.lines.length; i++) {
+            if (!re.test(f.lines[i])) continue;
             if (matches >= maxResults || size > MAX_CHARS) { truncated = true; break outer; }
             if (!hitThisFile) { hitThisFile = true; filesHit++; }
             matches++;
-            const from = Math.max(0, i - ctx), to = Math.min(fl.length - 1, i + ctx);
+            const from = Math.max(0, i - ctx), to = Math.min(f.lines.length - 1, i + ctx);
             for (let j = from; j <= to; j++) {
-                const line = `${f.path}:${j + 1}${j === i ? ':' : '-'} ${fl[j].replace(/\r$/, '').slice(0, 220)}`;
+                const line = `${f.path}:${j + 1}${j === i ? ':' : '-'} ${f.lines[j].replace(/\r$/, '').slice(0, 220)}`;
                 out.push(line);
                 size += line.length + 1;
             }
@@ -861,7 +796,7 @@ async function planBulkRename(args) {
         const tf = textByPath.get(e.path);
         let newText = null;
         if (tf) {
-            const old = tf.text;
+            const old = tf.lines.join('\n');
             const t = applyContentRules(old, reps);
             if (t !== old) newText = t;
         }
@@ -888,7 +823,7 @@ async function previewBulkRename(args) {
     const isSrc = (p) => /\.(kt|java)$/.test(p);
     const config = [], literals = [];
     for (const c of edited) {
-        const lines = textByPath.get(c.path).text.split('\n');
+        const lines = textByPath.get(c.path).lines;
         let perFile = 0;
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i].replace(/\r$/, '');
@@ -903,10 +838,8 @@ async function previewBulkRename(args) {
         const changed = new Map(changes.map(c => [c.path, c.newText]));
         for (const [p, f] of textByPath) {
             if (plan.skip.some(s => p.includes(s))) continue;
-            if (leftovers.length >= 40) break;
-            const text = changed.get(p) ?? f.text;
-            if (!words.some(w => text.includes(w))) continue;
-            const lines = text.split('\n');
+            const text = changed.get(p) ?? null;
+            const lines = text !== null ? text.split('\n') : f.lines;
             for (let i = 0; i < lines.length && leftovers.length < 40; i++) {
                 if (words.some(w => lines[i].includes(w))) leftovers.push(`${p}:${i + 1}: ${lines[i].replace(/\r$/, '').trim().slice(0, 200)}`);
             }
@@ -937,7 +870,7 @@ async function applyBulkRename(args) {
     const { api, changes } = plan;
 
     const mk = await ghJson(`${api}/git/refs`, { method: 'POST', body: JSON.stringify({ ref: `refs/heads/${args.branch}`, sha: plan.headSha }) });
-    if (!mk.res.ok) throw new Error(`Create branch "${args.branch}": ${mk.data.message || mk.res.status}. If an earlier apply_bulk_rename call timed out, it probably finished: check that branch before retrying, or use a different branch name.`);
+    if (!mk.res.ok) throw new Error(`Create branch "${args.branch}": ${mk.data.message || mk.res.status} (use a branch name that does not exist yet)`);
 
     try {
         const entries = [];
@@ -982,182 +915,43 @@ async function applyBulkRename(args) {
             if (!pr.res.ok) throw new Error(`Open PR: ${pr.data.message || pr.res.status}`);
             result.pr_url = pr.data.html_url;
         }
-        repoCache = null; // free memory
         return JSON.stringify(result);
     } catch (err) {
-        repoCache = null;
         throw new Error(`${err.message}. The branch "${args.branch}" was created but may be incomplete: use a different branch name for the next try.`);
     }
 }
 
-// ---------- Commits & branches ----------
 async function listRecentCommits(args) {
     const { owner, repo } = resolveRepo(args);
     const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const limit = Math.min(Math.max(parseInt(args.limit, 10) || 15, 1), 50);
+    const limit = Math.min(Math.max(parseInt(args.limit, 10) || 10, 1), 30);
+
     let url = `${api}/commits?per_page=${limit}`;
     if (args.branch) url += `&sha=${encodeURIComponent(args.branch)}`;
     if (args.path) url += `&path=${encodeURIComponent(args.path)}`;
-    if (args.author) url += `&author=${encodeURIComponent(args.author)}`;
     const { res, data } = await ghJson(url);
     if (!res.ok) throw new Error(`List commits: ${data.message || res.status}`);
-    const out = data.map(c => ({
-        sha: c.sha.slice(0, 7), author: c.commit.author?.name, date: c.commit.author?.date,
-        message: (c.commit.message || '').split('\n')[0].slice(0, 120)
-    }));
-    return JSON.stringify(out, null, 2);
-}
+    if (!Array.isArray(data) || !data.length) throw new Error('No commits found for that branch/path');
 
-async function getCommit(args) {
-    const { owner, repo } = resolveRepo(args);
-    if (!args.sha) throw new Error('sha is required');
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const { res, data } = await ghJson(`${api}/commits/${encodeURIComponent(args.sha)}`);
-    if (!res.ok) throw new Error(`Commit ${args.sha}: ${data.message || res.status}`);
-    return JSON.stringify({
-        sha: data.sha.slice(0, 7), author: data.commit.author?.name, date: data.commit.author?.date,
-        message: data.commit.message, stats: data.stats,
-        files: (data.files || []).map(f => ({ path: f.filename, status: f.status, additions: f.additions, deletions: f.deletions }))
-    }, null, 2);
-}
-
-async function listBranches(args) {
-    const { owner, repo } = resolveRepo(args);
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const info = await ghJson(api);
-    if (!info.res.ok) throw new Error(`Repo: ${info.data.message || info.res.status}`);
-    const defBranch = info.data.default_branch;
-    const { res, data } = await ghJson(`${api}/branches?per_page=100`);
-    if (!res.ok) throw new Error(`List branches: ${data.message || res.status}`);
-
-    const out = [];
-    for (const b of data) {
-        const row = { branch: b.name, sha: b.commit.sha.slice(0, 7), default: b.name === defBranch };
-        if (b.name !== defBranch) {
-            const cmp = await ghJson(`${api}/compare/${encodeURIComponent(defBranch)}...${encodeURIComponent(b.name)}`);
-            if (cmp.res.ok) { row.ahead = cmp.data.ahead_by; row.behind = cmp.data.behind_by; }
-        }
-        out.push(row);
+    // The list endpoint doesn't include per-commit files, so fetch each commit's detail
+    const commits = [];
+    for (const c of data) {
+        const { res: cRes, data: cData } = await ghJson(`${api}/commits/${c.sha}`);
+        if (!cRes.ok) throw new Error(`Commit ${c.sha}: ${cData.message || cRes.status}`);
+        commits.push({
+            sha: c.sha.slice(0, 7),
+            author: c.commit?.author?.name || c.author?.login || 'unknown',
+            date: c.commit?.author?.date,
+            message: (c.commit?.message || '').split('\n')[0],
+            files: (cData.files || []).map(f => ({
+                path: f.filename,
+                status: f.status,
+                additions: f.additions,
+                deletions: f.deletions
+            }))
+        });
     }
-    return JSON.stringify(out, null, 2);
-}
-
-async function deleteBranch(args) {
-    const { owner, repo } = resolveRepo(args);
-    if (!args.branch) throw new Error('branch is required');
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const info = await ghJson(api);
-    if (!info.res.ok) throw new Error(`Repo: ${info.data.message || info.res.status}`);
-    if (args.branch === info.data.default_branch) throw new Error(`Refusing to delete the default branch "${args.branch}"`);
-    const del = await fetch(`${api}/git/refs/heads/${encodePath(args.branch)}`, { method: 'DELETE', headers: ghHeaders() });
-    if (del.status !== 204) {
-        const d = await del.json().catch(() => ({}));
-        throw new Error(`Delete branch "${args.branch}": ${d.message || del.status}`);
-    }
-    return JSON.stringify({ status: 'deleted', branch: args.branch });
-}
-
-// ---------- Pull requests ----------
-async function listPullRequests(args) {
-    const { owner, repo } = resolveRepo(args);
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const state = args.state || 'open';
-    let url = `${api}/pulls?state=${encodeURIComponent(state)}&per_page=${Math.min(Math.max(parseInt(args.limit, 10) || 20, 1), 50)}`;
-    if (args.base) url += `&base=${encodeURIComponent(args.base)}`;
-    const { res, data } = await ghJson(url);
-    if (!res.ok) throw new Error(`List pull requests: ${data.message || res.status}`);
-    return JSON.stringify(data.map(p => ({
-        number: p.number, title: p.title, state: p.state, draft: p.draft,
-        branch: p.head.ref, base: p.base.ref, mergeable_state: p.mergeable_state, url: p.html_url
-    })), null, 2);
-}
-
-async function getPullRequestFiles(args) {
-    const { owner, repo } = resolveRepo(args);
-    if (!args.number) throw new Error('number is required');
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const pr = await ghJson(`${api}/pulls/${args.number}`);
-    if (!pr.res.ok) throw new Error(`PR #${args.number}: ${pr.data.message || pr.res.status}`);
-    const { res, data } = await ghJson(`${api}/pulls/${args.number}/files?per_page=100`);
-    if (!res.ok) throw new Error(`PR #${args.number} files: ${data.message || res.status}`);
-    return JSON.stringify({
-        number: pr.data.number, title: pr.data.title, branch: pr.data.head.ref, base: pr.data.base.ref,
-        mergeable: pr.data.mergeable, files: data.map(f => ({ path: f.filename, status: f.status, additions: f.additions, deletions: f.deletions }))
-    }, null, 2);
-}
-
-async function mergePullRequest(args) {
-    const { owner, repo } = resolveRepo(args);
-    if (!args.number) throw new Error('number is required');
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const pr = await ghJson(`${api}/pulls/${args.number}`);
-    if (!pr.res.ok) throw new Error(`PR #${args.number}: ${pr.data.message || pr.res.status}`);
-    if (pr.data.base.ref === (await ghJson(api)).data.default_branch && process.env.ALLOW_MAIN_COMMITS !== 'true') {
-        throw new Error(`Merging into "${pr.data.base.ref}" is disabled on this server. Ask the owner to set ALLOW_MAIN_COMMITS=true.`);
-    }
-    const method = ['merge', 'squash', 'rebase'].includes(args.merge_method) ? args.merge_method : 'merge';
-    const { res, data } = await ghJson(`${api}/pulls/${args.number}/merge`, {
-        method: 'PUT', body: JSON.stringify({ merge_method: method, commit_title: args.commit_title })
-    });
-    if (!res.ok) throw new Error(`Merge PR #${args.number}: ${data.message || res.status}`);
-    return JSON.stringify({ status: 'merged', number: args.number, sha: (data.sha || '').slice(0, 7) });
-}
-
-// ---------- Issues & comments ----------
-async function listIssues(args) {
-    const { owner, repo } = resolveRepo(args);
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    let url = `${api}/issues?state=${encodeURIComponent(args.state || 'open')}&per_page=${Math.min(Math.max(parseInt(args.limit, 10) || 20, 1), 50)}`;
-    if (args.labels) url += `&labels=${encodeURIComponent(args.labels)}`;
-    const { res, data } = await ghJson(url);
-    if (!res.ok) throw new Error(`List issues: ${data.message || res.status}`);
-    return JSON.stringify(data.filter(i => !i.pull_request).map(i => ({
-        number: i.number, title: i.title, state: i.state, labels: (i.labels || []).map(l => l.name), url: i.html_url
-    })), null, 2);
-}
-
-async function createIssue(args) {
-    const { owner, repo } = resolveRepo(args);
-    if (!args.title) throw new Error('title is required');
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const { res, data } = await ghJson(`${api}/issues`, {
-        method: 'POST', body: JSON.stringify({ title: args.title, body: args.body || '', labels: args.labels || undefined })
-    });
-    if (!res.ok) throw new Error(`Create issue: ${data.message || res.status}`);
-    return JSON.stringify({ status: 'created', number: data.number, url: data.html_url });
-}
-
-async function addComment(args) {
-    const { owner, repo } = resolveRepo(args);
-    if (!args.number) throw new Error('number is required (issue or pull request number)');
-    if (!args.body) throw new Error('body is required');
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const { res, data } = await ghJson(`${api}/issues/${args.number}/comments`, { method: 'POST', body: JSON.stringify({ body: args.body }) });
-    if (!res.ok) throw new Error(`Comment on #${args.number}: ${data.message || res.status}`);
-    return JSON.stringify({ status: 'commented', number: args.number, url: data.html_url });
-}
-
-// ---------- Releases & workflow runs ----------
-async function listReleases(args) {
-    const { owner, repo } = resolveRepo(args);
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    const { res, data } = await ghJson(`${api}/releases?per_page=${Math.min(Math.max(parseInt(args.limit, 10) || 10, 1), 30)}`);
-    if (!res.ok) throw new Error(`List releases: ${data.message || res.status}`);
-    return JSON.stringify(data.map(r => ({ tag: r.tag_name, name: r.name, draft: r.draft, prerelease: r.prerelease, published: r.published_at, url: r.html_url })), null, 2);
-}
-
-async function listWorkflowRuns(args) {
-    const { owner, repo } = resolveRepo(args);
-    const api = `https://api.github.com/repos/${owner}/${repo}`;
-    let url;
-    if (args.workflow) url = `${api}/actions/workflows/${(await resolveWorkflow(api, args.workflow)).id}/runs`;
-    else url = `${api}/actions/runs`;
-    url += `?per_page=${Math.min(Math.max(parseInt(args.limit, 10) || 10, 1), 30)}`;
-    if (args.branch) url += `&branch=${encodeURIComponent(args.branch)}`;
-    if (args.status) url += `&status=${encodeURIComponent(args.status)}`;
-    const { res, data } = await ghJson(url);
-    if (!res.ok) throw new Error(`List workflow runs: ${data.message || res.status}`);
-    return JSON.stringify((data.workflow_runs || []).map(runSummary), null, 2);
+    return JSON.stringify(commits, null, 2);
 }
 
 async function createPullRequest(args) {
@@ -1256,17 +1050,6 @@ async function handleMessage(msg) {
                     else if (name === 'get_build_status') text = await getBuildStatus(args);
                     else if (name === 'get_build_log') text = await getBuildLog(args);
                     else if (name === 'list_recent_commits') text = await listRecentCommits(args);
-                    else if (name === 'get_commit') text = await getCommit(args);
-                    else if (name === 'list_branches') text = await listBranches(args);
-                    else if (name === 'delete_branch') text = await deleteBranch(args);
-                    else if (name === 'list_pull_requests') text = await listPullRequests(args);
-                    else if (name === 'get_pull_request_files') text = await getPullRequestFiles(args);
-                    else if (name === 'merge_pull_request') text = await mergePullRequest(args);
-                    else if (name === 'list_issues') text = await listIssues(args);
-                    else if (name === 'create_issue') text = await createIssue(args);
-                    else if (name === 'add_comment') text = await addComment(args);
-                    else if (name === 'list_releases') text = await listReleases(args);
-                    else if (name === 'list_workflow_runs') text = await listWorkflowRuns(args);
                     else if (name === 'preview_bulk_rename') text = await previewBulkRename(args);
                     else if (name === 'apply_bulk_rename') text = await applyBulkRename(args);
                     else throw new Error(`Unknown tool: ${name}`);
@@ -1313,10 +1096,6 @@ app.post(['/', '/mcp'], async (req, res) => {
         return out.length ? res.json(out) : res.status(202).end();
     }
     const out = await handleMessage(body);
-    if (res.locals) {
-        if (out?.result?.isError) res.locals.note = `TOOL ERROR: ${String(out.result.content?.[0]?.text || '').replace(/\s+/g, ' ').slice(0, 160)}`;
-        else if (out?.error) res.locals.note = `RPC ERROR: ${String(out.error.message || '').slice(0, 160)}`;
-    }
     return out ? res.json(out) : res.status(202).end();
 });
 
@@ -1326,3 +1105,5 @@ app.listen(PORT, () => {
     if (!GITHUB_PAT) console.warn('WARNING: GITHUB_PAT is not set');
     if (!MCP_SECRET) console.warn('WARNING: MCP_SECRET is not set, /mcp is open to anyone with the URL');
 });
+
+            
